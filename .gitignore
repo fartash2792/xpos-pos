@@ -11,3 +11,5 @@ frontend/dist-standalone/
 *.zip
 .DS_Store
 npm-debug.log*
+.vercel
+.env*

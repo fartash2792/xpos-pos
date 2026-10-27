@@ -17,6 +17,6 @@
     "test": "npm --prefix server test"
   },
   "engines": {
-    "node": ">=18"
+    "node": "22.x"
   }
 }

@@ -95,12 +95,49 @@ Environment variables used:
 | `JWT_SECRET` | Signs login tokens. Must stay stable across restarts or everyone gets logged out. |
 | `PORT` | Set by Render automatically. |
 | `SEED_DEMO` | `false` to skip creating the demo business on an empty database. |
-| `DB_POOL_MAX` | Postgres pool size (default 5; keep low on free plans). |
+| `DB_POOL_MAX` | Postgres pool size (default 5, or 2 on Vercel; keep low on free plans). |
 
 Free-tier notes:
 - The free web service sleeps after ~15 minutes idle; the first request afterwards takes 30–60 s to wake. The PWA keeps working offline on devices and syncs once the server is awake.
 - Render's filesystem is ephemeral, so **don't use SQLite on Render**; all data lives in Postgres.
 - Local Postgres for testing: `DATABASE_URL=postgres://user:pass@localhost:5432/xpos DATABASE_SSL=false npm test`.
+
+## Deploy to Vercel + Neon (free, serverless)
+
+Vercel's free Hobby plan serves the built PWA from its CDN and runs the API as one serverless function (`api/index.js`), which wraps the same Express app the Node server uses. Data lives in Neon Postgres. SQLite isn't available here: the function refuses to start without `DATABASE_URL`.
+
+What the repo already contains:
+- `vercel.json`: installs with `npm run install:all`, builds with `npm run build`, publishes `frontend/dist`, rewrites `/api/*` to the function and everything else to `index.html`, and sends `sw.js`, `workbox-*.js`, `manifest.webmanifest` and `index.html` with `max-age=0, must-revalidate` so service-worker updates reach devices. Hashed files in `/assets` are cached for a year.
+- `api/index.js`: on each cold start it runs pending migrations and, on an empty database, seeds the demo business, once, before the first request. Concurrent cold starts are serialized with a Postgres advisory lock, so nothing runs twice.
+- Node 22 (`"engines": { "node": "22.x" }` in the root `package.json`).
+
+### Steps
+
+1. **Neon:** create a project at [neon.tech](https://neon.tech). Under **Connection details**, turn on **Connection pooling** and copy the **pooled** string (the host contains `-pooler`), e.g. `postgresql://user:pass@ep-xxx-pooler.region.aws.neon.tech/neondb?sslmode=require`. Pick a Neon region close to your Vercel function region (Vercel's default is `iad1`, Washington DC, which matches Neon's `us-east-1`).
+2. **Vercel, from the dashboard:** **Add New → Project**, import the GitHub repo, keep the framework preset as **Other** (the settings come from `vercel.json`), add the environment variables below, then **Deploy**.
+3. **Or from the CLI**, at the repo root with a token from *Account Settings → Tokens*:
+
+   ```bash
+   export VERCEL_TOKEN=...            # never commit this
+   npx vercel link --yes --token $VERCEL_TOKEN          # first time: creates/links the project
+   printf '%s' "$DATABASE_URL" | npx vercel env add DATABASE_URL production --token $VERCEL_TOKEN
+   printf '%s' "$(openssl rand -hex 32)" | npx vercel env add JWT_SECRET production --token $VERCEL_TOKEN
+   npx vercel deploy --prod --yes --token $VERCEL_TOKEN
+   ```
+
+4. Open `https://<project>.vercel.app`, log in with `admin@xpos.local` / `admin123`, and **change the password right away**. Or set `SEED_DEMO=false` before the first deploy and use **Sign up**.
+
+| Variable | Required | Value |
+|---|---|---|
+| `DATABASE_URL` | yes | Neon **pooled** connection string. `sslmode`/`channel_binding` params are fine (TLS is handled by the server). |
+| `JWT_SECRET` | yes | A long random string (`openssl rand -hex 32`). It must stay the same between deploys or everyone gets logged out. |
+| `SEED_DEMO` | no | `false` to skip the demo business on an empty database. |
+| `DB_POOL_MAX` | no | Connections per function instance (default 2 on Vercel). |
+
+Notes:
+- The first request after a while idle is a cold start (about 1–3 s; a little longer the very first time, while tables are created). Neon's free compute also sleeps after 5 minutes idle and wakes on the next query. The PWA keeps working offline either way and syncs when the API answers.
+- Hobby limits: the function's max duration is set to 30 s, and request bodies are capped at 4.5 MB by Vercel. Very large backup restores or sync pushes over that size fail on Vercel; the client pushes in batches, so normal syncing is well under it.
+- Local check of the Vercel setup without a Vercel account: `npm run build`, then `DATABASE_URL=... JWT_SECRET=... node scripts/vercel-local.mjs` (serves `frontend/dist` with the `vercel.json` headers and SPA fallback, and sends `/api/*` to `api/index.js` on port 3100). Then run `BASE=http://127.0.0.1:3100 npm test`.
 
 ## Deploy to a VPS (Ubuntu + pm2 + nginx)
 
@@ -192,6 +229,8 @@ server/
   src/store.js LWW upsert, sequence allocation, invoice numbering, pull windows
   migrations/  Knex migrations     scripts/ migrate, seed, smoke-test
   app.js       entry file for cPanel/Passenger
+api/index.js   Vercel serverless function (wraps the Express app; migrate + seed once per cold start)
+vercel.json    Vercel build, rewrites and cache headers     scripts/vercel-local.mjs  local Vercel stand-in
 frontend/
   src/lib/     db.js (Dexie + outbox), sync.js (engine), session.js (online/offline auth, PIN), receipt.js
   src/pages/   Dashboard, POS, Sales, Quotations, Products, Inventory, Purchases, Parties, Accounts, Expenses, Shifts, Reports, Settings

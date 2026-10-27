@@ -4,7 +4,7 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import fs from 'node:fs';
 import path from 'node:path';
-import { db, ROOT } from './db.js';
+import { db, ROOT, IS_SERVERLESS, isPg, withInitLock } from './db.js';
 import { seedDemoIfEmpty } from './seed.js';
 import { requireAuth, requirePerm, signup, login, createUser, touchUser, pinHash } from './auth.js';
 import { applyChanges, pullChanges, listRecords, getRecord, saveBundle, userToRecord, SYNCABLE } from './store.js';
@@ -153,19 +153,56 @@ app.get('/api/reports/trial-balance', requireAuth, requirePerm('accounts'), wrap
 }));
 
 // ---------- frontend ----------
+// (On Vercel the CDN serves frontend/dist; the function only handles /api/*.)
 const dist = path.resolve(ROOT, '..', 'frontend', 'dist');
-if (fs.existsSync(dist)) {
+if (!IS_SERVERLESS && fs.existsSync(dist)) {
   app.use(express.static(dist, { index: false, maxAge: '1h', setHeaders: (res, p) => { if (p.endsWith('sw.js') || p.endsWith('index.html')) res.setHeader('Cache-Control', 'no-cache'); } }));
   app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(dist, 'index.html')));
 }
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-export async function start({ port = Number(process.env.PORT || 3000), host = process.env.HOST || '0.0.0.0', quiet = false } = {}) {
-  const [batch, log] = await db.migrate.latest();
-  if (log.length && !quiet) console.log(`Migrated batch ${batch}: ${log.join(', ')}`);
-  if (process.env.SEED_DEMO !== 'false' && await seedDemoIfEmpty() && !quiet) {
-    console.log('Fresh database: seeded demo business (admin@xpos.local / admin123, POS PIN 1234). Change this password!');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Migrate, then seed the demo business on an empty database. Safe to run from several
+// processes at once (e.g. concurrent serverless cold starts): knex's migration lock is
+// retried, and a losing seed (unique email) rolls back in its transaction and is ignored.
+async function prepareDatabase({ quiet = false } = {}) {
+  // On Postgres we hold the advisory init lock (withInitLock), so no other process can be
+  // migrating: clear any knex lock row left behind by an instance that was killed mid-migration.
+  if (isPg) await db.migrate.forceFreeMigrationsLock().catch(() => {});
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const [batch, log] = await db.migrate.latest();
+      if (log.length && !quiet) console.log(`Migrated batch ${batch}: ${log.join(', ')}`);
+      break;
+    } catch (e) {
+      // Another process is migrating (lock held) or created knex's own tables at the same moment.
+      const racing = /already locked/i.test(e.message) || ['23505', '42P07', '42710'].includes(e.code) || /already exists/i.test(e.message);
+      if (!racing || attempt >= 20) throw e;
+      await sleep(500);
+    }
   }
+  if (process.env.SEED_DEMO === 'false') return;
+  try {
+    if (await seedDemoIfEmpty() && !quiet) {
+      console.log('Fresh database: seeded demo business (admin@xpos.local / admin123, POS PIN 1234). Change this password!');
+    }
+  } catch (e) {
+    const row = await db('users').count({ n: '*' }).first();
+    if (!(Number(row?.n || 0) > 0)) throw e; // another instance seeded first: fine
+  }
+}
+
+// Memoized: runs once per process (once per serverless cold start). A failure is not cached,
+// so the next request retries instead of the instance being stuck.
+let readyPromise = null;
+export function ready(opts) {
+  if (!readyPromise) readyPromise = withInitLock(() => prepareDatabase(opts)).catch(e => { readyPromise = null; throw e; });
+  return readyPromise;
+}
+
+export async function start({ port = Number(process.env.PORT || 3000), host = process.env.HOST || '0.0.0.0', quiet = false } = {}) {
+  await ready({ quiet });
   return new Promise(resolve => {
     const server = app.listen(port, host, () => {
       if (!quiet) console.log(`XPOS server (${db.client.config.client}) listening on http://${host}:${server.address().port}`);

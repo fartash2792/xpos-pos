@@ -1,0 +1,22 @@
+{
+  "name": "xpos-clone",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "XPOS \u2013 offline-first multi-business POS (retail, wholesale, pharmacy, bakery, clothing, mobile shops)",
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix frontend install --include=dev",
+    "build": "npm --prefix frontend run build",
+    "build:standalone": "npm --prefix frontend run build:standalone",
+    "migrate": "npm --prefix server run migrate",
+    "seed": "npm --prefix server run seed",
+    "setup": "npm run install:all && npm run build && npm run migrate && npm run seed",
+    "start": "npm --prefix server start",
+    "dev:server": "npm --prefix server run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "test": "npm --prefix server test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
